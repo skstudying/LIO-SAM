@@ -25,8 +25,10 @@ float32 initialGuessYaw
 
 # Point cloud messages
 sensor_msgs/PointCloud2 cloud_deskewed  # original cloud deskewed
-sensor_msgs/PointCloud2 cloud_corner    # extracted corner feature
-sensor_msgs/PointCloud2 cloud_surface   # extracted surface feature
+sensor_msgs/PointCloud2 cloud_corner    # extracted less sharp corner feature
+sensor_msgs/PointCloud2 cloud_surface   # extracted less surface surface feature
+sensor_msgs/PointCloud2 cloud_sharp_corner #extracted sharp corner feature
+sensor_msgs/PointCloud2 cloud_flat_surface #extracted flat surface feature
 
 # 3rd party messages
 sensor_msgs/PointCloud2 key_frame_cloud

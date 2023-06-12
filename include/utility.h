@@ -15,8 +15,10 @@
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 
-#include <opencv/cv.h>
+#include <boost/filesystem.hpp>
+#include <glog/logging.h>
 
+#include <pcl/console/time.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/search/impl/search.hpp>
@@ -25,17 +27,22 @@
 #include <pcl/common/common.h>
 #include <pcl/common/transforms.h>
 #include <pcl/registration/icp.h>
+#include <pcl/registration/ndt.h>
 #include <pcl/io/pcd_io.h>
+#include <pcl/filters/crop_box.h> 
 #include <pcl/filters/filter.h>
 #include <pcl/filters/voxel_grid.h>
-#include <pcl/filters/crop_box.h> 
 #include <pcl_conversions/pcl_conversions.h>
 
+// #include <opencv/cv.h>
+#include <opencv2/opencv.hpp>
+
 #include <tf/LinearMath/Quaternion.h>
+#include <tf_conversions/tf_eigen.h>
 #include <tf/transform_listener.h>
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
- 
+
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -52,13 +59,16 @@
 #include <iomanip>
 #include <array>
 #include <thread>
+#include <tictoc.h>
 #include <mutex>
 
 using namespace std;
 
 typedef pcl::PointXYZI PointType;
 
-enum class SensorType { VELODYNE, OUSTER, LIVOX };
+enum class SensorType { VELODYNE, OUSTER, LIVOX, RSLIDAR, RSLIDAR2 };
+
+enum degenerateDirection { kRoll, kPitch, kYaw, kXAxis, kYAxis, kZAxis };
 
 class ParamServer
 {
@@ -122,7 +132,8 @@ public:
     // voxel filter paprams
     float odometrySurfLeafSize;
     float mappingCornerLeafSize;
-    float mappingSurfLeafSize ;
+    float mappingSurfLeafSize;
+    float kLocalizationLeafSize;
 
     float z_tollerance; 
     float rotation_tollerance;
@@ -150,6 +161,56 @@ public:
     float globalMapVisualizationSearchRadius;
     float globalMapVisualizationPoseDensity;
     float globalMapVisualizationLeafSize;
+    
+    // VIO factor.
+    float kIntervalSlidingWindow;
+    float kThresTimestampAlignment;
+
+    // Cloud to base_link transformation.
+    bool kCloud2Base;
+    vector<double> kExtRotVCloud;
+    vector<double> kExtTransVCloud;
+    Eigen::Matrix3d kExtRotCloud;
+    Eigen::Vector3d kExtTransCloud;
+
+    // Initial guess method
+    bool kUseImuOdom;
+    bool kUseImuRot;
+    bool kUseLidarOdometry;
+
+    // PointCloud selection.
+    bool kSelectionMode;
+    bool kSelectGround;
+    bool kSelectBackGround;
+    bool kSelectObjects; 
+    
+    // Selection of strong feature.
+    bool kUseStrongFeature;
+
+    // Localization mode.
+    bool kLocalizationMode;
+    string kTrajPCDDir, kTransPCDDir, kGlobalMapPCDDir;
+    string kCornerPCDFolder, kSurfacePCDFolder;
+    int kNumSubmap;
+    int kLMOptIterTime;
+    int kICPOptIterTimes;
+    float kICPOptCorDistance;
+    float kLocalizationICPFrequency;
+    float kLocalizationICPThresh;
+
+    // Moving body Paras.
+    float kMaxVelX;
+    float kMaxVelY;
+    float kMaxVelZ;
+    float kMaxVelRoll;
+    float kMaxVelPitch;
+    float kMaxVelYaw;
+
+    // Num of history keyframes used for ICP in scan2map.
+    int kNumICPHistoryFrame;
+
+    // Distance traveld.
+    bool kPrintDistanceTraveled;
 
     ParamServer()
     {
@@ -187,6 +248,14 @@ public:
         {
             sensor = SensorType::LIVOX;
         }
+        else if (sensorStr == "rslidar")
+        {
+            sensor = SensorType::RSLIDAR;
+        }
+        else if (sensorStr == "rslidar2")
+        {
+            sensor = SensorType::RSLIDAR2;
+        }
         else
         {
             ROS_ERROR_STREAM(
@@ -222,6 +291,7 @@ public:
         nh.param<float>("lio_sam/odometrySurfLeafSize", odometrySurfLeafSize, 0.2);
         nh.param<float>("lio_sam/mappingCornerLeafSize", mappingCornerLeafSize, 0.2);
         nh.param<float>("lio_sam/mappingSurfLeafSize", mappingSurfLeafSize, 0.2);
+        nh.param<float>("lio_sam/localizationLeafSize", kLocalizationLeafSize, 0.5);
 
         nh.param<float>("lio_sam/z_tollerance", z_tollerance, FLT_MAX);
         nh.param<float>("lio_sam/rotation_tollerance", rotation_tollerance, FLT_MAX);
@@ -245,8 +315,64 @@ public:
         nh.param<float>("lio_sam/globalMapVisualizationSearchRadius", globalMapVisualizationSearchRadius, 1e3);
         nh.param<float>("lio_sam/globalMapVisualizationPoseDensity", globalMapVisualizationPoseDensity, 10.0);
         nh.param<float>("lio_sam/globalMapVisualizationLeafSize", globalMapVisualizationLeafSize, 1.0);
+        
+        nh.param<float>("lio_sam/intervalSlidingWindow", kIntervalSlidingWindow, 5.0);
+        nh.param<float>("lio_sam/thresTimestampAlignment", kThresTimestampAlignment, 0.015);
 
+        // Cloud to base_link transformation.
+        nh.param<bool>("lio_sam/cloud2Base", kCloud2Base, false);
+        nh.param < vector < double >> ("lio_sam/extrinsicRotCloud", kExtRotVCloud, vector<double>());
+        nh.param < vector < double >> ("lio_sam/extrinsicTransCloud", kExtTransVCloud, vector<double>());
+        if (kCloud2Base) {
+            kExtRotCloud = Eigen::Map<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>>(kExtRotVCloud.data(), 3, 3);
+            kExtTransCloud = Eigen::Map<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>>(kExtTransVCloud.data(), 3, 1);
+        }
+
+        //Initial guess options
+        nh.param<bool>("lio_sam/useImuOdom", kUseImuOdom, false);
+        nh.param<bool>("lio_sam/useImuRot", kUseImuRot, false);
+        nh.param<bool>("lio_sam/useLidarOdometry", kUseLidarOdometry, false);
+
+        // Pointcloud segmeatation
+        nh.param<bool>("lio_sam/selectionMode",  kSelectionMode, false);
+        nh.param<bool>("lio_sam/selectBackGround",  kSelectBackGround, false);
+        nh.param<bool>("lio_sam/selectGround", kSelectGround, false);
+        nh.param<bool>("lio_sam/selectObjects", kSelectObjects, false);
+        nh.param<bool>("lio_sam/useStrongFeature", kUseStrongFeature, false);
+        if (sensor != SensorType::LIVOX && kSelectionMode == true) {
+            kSelectionMode = false;
+            ROS_WARN(
+                "PointCloud Segmentation not availiable on current Lidar Type");
+        }
         usleep(100);
+
+        // Localization mode.
+        nh.param<bool>("lio_sam/localizationMode",  kLocalizationMode, false);
+        nh.param<std::string>("lio_sam/trajectoryPCDDirectory", kTrajPCDDir, "/home");
+        nh.param<std::string>("lio_sam/transformationPCDDirectory", kTransPCDDir, "/home");
+        nh.param<std::string>("lio_sam/globalMapPCDDirectory", kGlobalMapPCDDir, "/home");
+        nh.param<std::string>("lio_sam/cornerPCDFolder", kCornerPCDFolder, "/home");
+        nh.param<std::string>("lio_sam/surfacePCDFolder", kSurfacePCDFolder, "/home");
+        nh.param<int>("lio_sam/numSubmap", kNumSubmap, 10);
+        nh.param<int>("lio_sam/LMOptIterTimes", kLMOptIterTime, 30);
+        nh.param<int>("lio_sam/ICPOptIterTimes", kICPOptIterTimes, 20);
+        nh.param<float>("lio_sam/ICPOptCorDistance", kICPOptCorDistance, 1.0f);
+        nh.param<float>("lio_sam/localizationICPFrequency", kLocalizationICPFrequency, 10.0f);
+        nh.param<float>("lio_sam/localizationICPThresh", kLocalizationICPThresh, 5.0f);
+
+        // Moving body params.
+        nh.param<float>("lio_sam/mappingTransConstraintX", kMaxVelX, 1.5f);
+        nh.param<float>("lio_sam/mappingTransConstraintY", kMaxVelY, 1.5f);
+        nh.param<float>("lio_sam/mappingTransConstraintZ", kMaxVelZ, 3.0f);
+        nh.param<float>("lio_sam/mappingRotConstraintR", kMaxVelRoll, 4.0f);
+        nh.param<float>("lio_sam/mappingRotConstraintP", kMaxVelPitch, 4.0f);
+        nh.param<float>("lio_sam/mappingRotConstraintY", kMaxVelYaw, 1.7f);
+
+        // History key frames num for icp in scan2map.
+        nh.param<int>("lio_sam/numICPHistoryFram", kNumICPHistoryFrame, 1);
+
+        // Distance traveld. 
+        nh.param<bool>("lio_sam/printDistanceTraveled", kPrintDistanceTraveled, false);
     }
 
     sensor_msgs::Imu imuConverter(const sensor_msgs::Imu& imu_in)
